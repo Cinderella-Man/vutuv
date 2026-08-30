@@ -2150,9 +2150,15 @@ defmodule VutuvWeb.UI do
     """
   end
 
-  # A page's monogram is deliberately ONE letter — the shipped look of every
-  # organization tile — where a member's `name_initials/1` takes two.
-  defp organization_initial(name) do
+  @doc """
+  A page's monogram, deliberately ONE letter — the shipped look of every
+  organization tile — where a member's `name_initials/1` takes two.
+
+  Public for the same reason `name_initials/1` is: a surface that draws its own
+  tile (the composer's `@`-picker rows, which are built in JS from JSON) must
+  get the letter from here rather than spell the rule a second time.
+  """
+  def organization_initial(name) do
     name
     |> String.trim()
     |> String.first()
