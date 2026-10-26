@@ -461,11 +461,8 @@ defmodule Vutuv.Mentions do
           MapSet.new()
 
         names ->
-          names
-          |> resolvable_handles()
-          |> Map.keys()
-          |> MapSet.new()
-          |> MapSet.intersection(rendered_mentions(names))
+          held = names |> resolvable_handles() |> Map.keys()
+          held |> MapSet.new() |> MapSet.intersection(rendered_mentions(held))
       end
 
     {checked, resolved}
@@ -474,8 +471,8 @@ defmodule Vutuv.Mentions do
   # The renderer has the last word. Markdown runs before mentions are linked and
   # can take a handle apart: `_` delimits emphasis, so `@max_mustermann_` renders
   # as `@max<em>mustermann</em>`, and a handle the page will not link must not be
-  # promised as one. Each handle is written in its own paragraph, so none can
-  # affect another, and the whole list is rendered in one pass.
+  # promised as one. Only held handles are rendered, each in its own paragraph,
+  # so none can affect another, and the whole list is rendered in one pass.
   @rendered_mention ~r{class="mention">@([A-Za-z0-9_]+)</a>}
 
   defp rendered_mentions(handles) do
