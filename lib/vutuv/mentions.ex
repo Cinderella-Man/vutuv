@@ -67,7 +67,6 @@ defmodule Vutuv.Mentions do
   alias Vutuv.Chat.Message
   alias Vutuv.Fediverse
   alias Vutuv.Handles
-  alias Vutuv.Identity
   alias Vutuv.Jobs.JobPosting
   alias Vutuv.Organizations
   alias Vutuv.Organizations.Organization
@@ -76,7 +75,7 @@ defmodule Vutuv.Mentions do
   alias Vutuv.Profiles.WorkExperience
   alias Vutuv.Repo
   alias Vutuv.SearchText
-  alias Vutuv.Social
+  alias Vutuv.Social.Block
   alias Vutuv.Social.Follow
 
   # The canonical `@`/`#` entity grammar. It lives here (not in the renderer) so
@@ -386,9 +385,15 @@ defmodule Vutuv.Mentions do
   contains it, ready to be inserted as a bare `@handle`.
 
   Ranked **followed-first**, and inside each group handle-prefix matches before
-  name matches, then alphabetically. Somebody you follow is who you almost
+  name matches, then alphabetically by name (ignoring case), then by handle.
+  Members and pages share that one order. Somebody you follow is who you almost
   always mean, and a mention is a notification: offering the stranger first is
   how the wrong person gets one.
+
+  The order holds over **every** matching account, not over a sample of them:
+  a followee found only by name still comes first when a hundred strangers'
+  handles start with the term, and an account the viewer may not be offered
+  never takes the row of one they may.
 
   What it refuses to offer, so the picker cannot be a way around a decision the
   viewer or the site already made: an account blocked in either direction, a
@@ -409,15 +414,16 @@ defmodule Vutuv.Mentions do
     if String.length(normalized) < @suggest_min_chars do
       []
     else
-      blocked = Social.blocked_user_ids(viewer.id)
-
-      case suggest_users(viewer, normalized, blocked) ++ suggest_organizations(normalized) do
-        # No candidates, no ranking — and above all no follows query, which is
-        # the expensive half and would otherwise run for every half-typed handle
-        # that names nobody.
-        [] -> []
-        candidates -> candidates |> rank_suggestions(viewer) |> Enum.take(limit)
-      end
+      # Each kind answers its own best `limit` rows with their rank key (the
+      # one order, spelled out above `suggest_users/3`). The overall best
+      # `limit` are among those two lists, so merging them by the same key and
+      # cutting again ranks every matching account — no candidate pool for a
+      # followee to fall out of.
+      (suggest_users(viewer, normalized, limit) ++
+         suggest_organizations(viewer, normalized, limit))
+      |> Enum.sort_by(fn {rank, _identity} -> rank end)
+      |> Enum.take(limit)
+      |> Enum.map(fn {_rank, identity} -> identity end)
     end
   end
 
@@ -486,86 +492,88 @@ defmodule Vutuv.Mentions do
   @doc "How many handles one `check_handles/1` call answers about."
   def max_check_handles, do: @max_check_handles
 
-  # The candidate pool the ranking sorts, per kind. Deliberately wider than the
-  # eight rows the picker shows: the follow status that decides the order lives
-  # in another table, so the pool has to be big enough that a followee found by
-  # name is still in it. It IS a cap — a term matching more than 24 accounts can
-  # lose one to it — and the answer to that is the next letter, which is what
-  # somebody typing a handle is about to press anyway.
-  @suggest_pool 24
-
-  defp suggest_users(%User{id: viewer_id}, term, blocked) do
+  # Both kinds rank in SQL by the same key and hand it back beside the row, so
+  # the merge in `suggest/3` sorts exactly what the database sorted:
+  #
+  #   1. followed before not followed — the follow edge is LEFT JOINed on the
+  #      `follows_follower_id_followee_*` unique indexes, so it is at most one
+  #      row per candidate however many accounts the viewer follows. Muted
+  #      follows count: muting drops somebody's posts out of a feed, it does
+  #      not make them a stranger to talk to;
+  #   2. "the handle itself starts with what was typed" before "the name happens
+  #      to contain it": somebody typing `@ad` is spelling a handle;
+  #   3. the lowercased name, compared bytewise (`COLLATE "C"`) because that is
+  #      how Elixir compares the binaries the merge sorts;
+  #   4. the handle, which is unique, so equal names still have one order.
+  #
+  # Every exclusion is part of the query rather than a filter after it, so the
+  # LIMIT counts only accounts the viewer may be offered.
+  defp suggest_users(%User{id: viewer_id}, term, limit) do
     pattern = prefix(term)
 
     from(u in User,
-      select: struct(u, ^User.listing_fields()),
+      as: :candidate,
+      left_join: f in Follow,
+      on: f.follower_id == ^viewer_id and f.followee_id == u.id,
       where: u.id != ^viewer_id,
       where: account_confirmed_row(u) and not account_hidden_row(u),
       where:
         ilike(u.username, ^pattern) or name_ilike(u.first_name, u.last_name, ^contains(term)),
-      # "The handle itself starts with what was typed" sorts ahead of "the name
-      # happens to contain it": somebody typing `@ad` is spelling a handle.
+      # A block in either direction ends every kind of contact, an offer to
+      # mention included — the same gate the saved-people lists apply.
+      where:
+        not exists(
+          from(b in Block,
+            where:
+              (b.blocker_id == ^viewer_id and b.blocked_id == parent_as(:candidate).id) or
+                (b.blocker_id == parent_as(:candidate).id and b.blocked_id == ^viewer_id)
+          )
+        ),
       order_by: [
+        asc: is_nil(f.id),
         asc: fragment("CASE WHEN ? ILIKE ? THEN 0 ELSE 1 END", u.username, ^pattern),
-        asc: u.first_name,
-        asc: u.last_name
+        asc: fragment(~s|lower(concat_ws(' ', ?, ?)) COLLATE "C"|, u.first_name, u.last_name),
+        asc: u.username
       ],
-      limit: @suggest_pool
+      limit: ^limit,
+      select: {
+        {is_nil(f.id), fragment("CASE WHEN ? ILIKE ? THEN 0 ELSE 1 END", u.username, ^pattern),
+         fragment(~s|lower(concat_ws(' ', ?, ?)) COLLATE "C"|, u.first_name, u.last_name),
+         u.username},
+        struct(u, ^User.listing_fields())
+      }
     )
     |> Repo.all()
-    |> Enum.reject(&MapSet.member?(blocked, to_string(&1.id)))
   end
 
-  defp suggest_organizations(term) do
+  defp suggest_organizations(%User{id: viewer_id}, term, limit) do
     pattern = prefix(term)
 
     from(o in Organization,
-      # Exactly what a picker row draws (`VutuvWeb.MentionController.payload/1`):
-      # the handle, the name, the monogram behind it, the logo and the page path.
-      select: struct(o, [:id, :name, :slug, :username, :logo]),
+      left_join: f in Follow,
+      on: f.follower_id == ^viewer_id and f.followee_organization_id == o.id,
       where: not is_nil(o.username),
       where: organization_public_row(o),
       where: ilike(o.username, ^pattern) or ilike(o.name, ^contains(term)),
       order_by: [
+        asc: is_nil(f.id),
         asc: fragment("CASE WHEN ? ILIKE ? THEN 0 ELSE 1 END", o.username, ^pattern),
-        asc: o.name
+        asc: fragment(~s|lower(?) COLLATE "C"|, o.name),
+        asc: o.username
       ],
-      limit: @suggest_pool
+      limit: ^limit,
+      # Exactly what a picker row draws (`VutuvWeb.MentionController.payload/1`):
+      # the handle, the name, the monogram behind it, the logo and the page path.
+      select: {
+        {is_nil(f.id), fragment("CASE WHEN ? ILIKE ? THEN 0 ELSE 1 END", o.username, ^pattern),
+         fragment(~s|lower(?) COLLATE "C"|, o.name), o.username},
+        struct(o, [:id, :name, :slug, :username, :logo])
+      }
     )
     |> Repo.all()
   end
 
   defp prefix(term), do: SearchText.escape_like(term) <> "%"
-
-  # A stable partition, so each group keeps the order the queries gave it.
-  defp rank_suggestions(candidates, viewer) do
-    followed = followed_among(viewer, candidates)
-    {known, rest} = Enum.split_with(candidates, &MapSet.member?(followed, Identity.id(&1)))
-    known ++ rest
-  end
-
-  # Which of these candidates the viewer follows — asked ABOUT the candidates,
-  # not by loading the follow graph and looking them up in it. The answer is at
-  # most one row per candidate however many thousand accounts the viewer
-  # follows, and both `follows_follower_id_followee_*_index` serve it directly.
-  # Muted follows count: muting drops somebody's posts out of a feed, it does
-  # not make them a stranger to talk to.
-  defp followed_among(%User{id: viewer_id}, candidates) do
-    ids = Enum.map(candidates, &Identity.id/1)
-
-    # The two id columns are selected separately rather than COALESCEd in a
-    # fragment: a fragment has no type, so the ids would come back as raw
-    # 16-byte binaries and match nothing against `Identity.id/1`'s string form.
-    from(f in Follow,
-      where: f.follower_id == ^viewer_id,
-      where: f.followee_id in ^ids or f.followee_organization_id in ^ids,
-      select: {f.followee_id, f.followee_organization_id}
-    )
-    |> Repo.all()
-    |> Enum.flat_map(fn {user_id, organization_id} -> [user_id, organization_id] end)
-    |> Enum.reject(&is_nil/1)
-    |> MapSet.new()
-  end
 
   ## Existence validation ---------------------------------------------------
 
