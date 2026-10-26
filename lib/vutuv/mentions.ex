@@ -457,11 +457,37 @@ defmodule Vutuv.Mentions do
 
     resolved =
       case checked do
-        [] -> MapSet.new()
-        names -> names |> resolvable_handles() |> Map.keys() |> MapSet.new()
+        [] ->
+          MapSet.new()
+
+        names ->
+          names
+          |> resolvable_handles()
+          |> Map.keys()
+          |> MapSet.new()
+          |> MapSet.intersection(rendered_mentions(names))
       end
 
     {checked, resolved}
+  end
+
+  # The renderer has the last word. Markdown runs before mentions are linked and
+  # can take a handle apart: `_` delimits emphasis, so `@max_mustermann_` renders
+  # as `@max<em>mustermann</em>`, and a handle the page will not link must not be
+  # promised as one. Each handle is written in its own paragraph, so none can
+  # affect another, and the whole list is rendered in one pass.
+  @rendered_mention ~r{class="mention">@([A-Za-z0-9_]+)</a>}
+
+  defp rendered_mentions(handles) do
+    html =
+      handles
+      |> Enum.map_join("\n\n", &("@" <> &1))
+      |> VutuvWeb.Markdown.render()
+      |> Phoenix.HTML.safe_to_string()
+
+    @rendered_mention
+    |> Regex.scan(html, capture: :all_but_first)
+    |> MapSet.new(fn [handle] -> String.downcase(handle) end)
   end
 
   @doc """
@@ -540,7 +566,9 @@ defmodule Vutuv.Mentions do
         {is_nil(f.id), fragment("CASE WHEN ? ILIKE ? THEN 0 ELSE 1 END", u.username, ^pattern),
          fragment(~s|lower(concat_ws(' ', ?, ?)) COLLATE "C"|, u.first_name, u.last_name),
          u.username},
-        struct(u, ^User.listing_fields())
+        # The moderation state lets the avatar URL helpers answer "no picture"
+        # for an avatar still held for review.
+        struct(u, ^[:avatar_moderation | User.listing_fields()])
       }
     )
     |> Repo.all()
