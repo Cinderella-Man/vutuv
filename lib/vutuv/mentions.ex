@@ -385,10 +385,11 @@ defmodule Vutuv.Mentions do
   contains it, ready to be inserted as a bare `@handle`.
 
   Ranked **followed-first**, and inside each group handle-prefix matches before
-  name matches, then alphabetically by name (ignoring case), then by handle.
-  Members and pages share that one order. Somebody you follow is who you almost
-  always mean, and a mention is a notification: offering the stranger first is
-  how the wrong person gets one.
+  name matches, then by name ignoring case, then by handle, both compared
+  character by character (by code point, so a space or `_` comes before any
+  letter). Members and pages share that one order. Somebody you follow is who
+  you almost always mean, and a mention is a notification: offering the
+  stranger first is how the wrong person gets one.
 
   The order holds over **every** matching account, not over a sample of them:
   a followee found only by name still comes first when a hundred strangers'
@@ -410,8 +411,10 @@ defmodule Vutuv.Mentions do
     normalized = Handles.normalize(term)
 
     # Characters, not bytes: one letter is one letter whether or not it is ASCII,
-    # and the floor is about how much the member has actually said.
-    if String.length(normalized) < @suggest_min_chars do
+    # and the floor is about how much the member has actually said. No handle
+    # or name holds a NUL byte (PostgreSQL cannot store one, and refuses it as a
+    # parameter), so a term carrying one matches nothing.
+    if String.length(normalized) < @suggest_min_chars or nul?(normalized) do
       []
     else
       # Each kind answers its own best `limit` rows with their rank key (the
@@ -461,7 +464,8 @@ defmodule Vutuv.Mentions do
           MapSet.new()
 
         names ->
-          held = names |> resolvable_handles() |> Map.keys()
+          # A NUL byte is in no handle, and PostgreSQL refuses it as a parameter.
+          held = names |> Enum.reject(&nul?/1) |> resolvable_handles() |> Map.keys()
           held |> MapSet.new() |> MapSet.intersection(rendered_mentions(held))
       end
 
@@ -527,7 +531,9 @@ defmodule Vutuv.Mentions do
   #      to contain it": somebody typing `@ad` is spelling a handle;
   #   3. the lowercased name, compared bytewise (`COLLATE "C"`) because that is
   #      how Elixir compares the binaries the merge sorts;
-  #   4. the handle, which is unique, so equal names still have one order.
+  #   4. the handle, which is unique, so equal names still have one order;
+  #      bytewise too, or the LIMIT would cut a tie in another order than the
+  #      merge sorts it, and a smaller limit would not be the top of a larger.
   #
   # Every exclusion is part of the query rather than a filter after it, so the
   # LIMIT counts only accounts the viewer may be offered.
@@ -556,7 +562,7 @@ defmodule Vutuv.Mentions do
         asc: is_nil(f.id),
         asc: fragment("CASE WHEN ? ILIKE ? THEN 0 ELSE 1 END", u.username, ^pattern),
         asc: fragment(~s|lower(concat_ws(' ', ?, ?)) COLLATE "C"|, u.first_name, u.last_name),
-        asc: u.username
+        asc: fragment(~s|? COLLATE "C"|, u.username)
       ],
       limit: ^limit,
       select: {
@@ -584,7 +590,7 @@ defmodule Vutuv.Mentions do
         asc: is_nil(f.id),
         asc: fragment("CASE WHEN ? ILIKE ? THEN 0 ELSE 1 END", o.username, ^pattern),
         asc: fragment(~s|lower(?) COLLATE "C"|, o.name),
-        asc: o.username
+        asc: fragment(~s|? COLLATE "C"|, o.username)
       ],
       limit: ^limit,
       # Exactly what a picker row draws (`VutuvWeb.MentionController.payload/1`):
@@ -599,6 +605,8 @@ defmodule Vutuv.Mentions do
   end
 
   defp prefix(term), do: SearchText.escape_like(term) <> "%"
+
+  defp nul?(text), do: String.contains?(text, <<0>>)
 
   ## Existence validation ---------------------------------------------------
 
